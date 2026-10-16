@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import {
   AlertCircle, ArrowDownToLine, ArrowLeft, ArrowRight, Check, CheckCircle2, ChevronDown,
   CircleHelp, Clipboard, FileUp, LoaderCircle, LockKeyhole, LogOut,
@@ -15,13 +15,15 @@ const consentFields = [
 ];
 
 async function api(path, options = {}) {
+  const { headers, ...requestOptions } = options;
   const response = await fetch(`/api${path}`, {
     credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
-    ...options
+    ...requestOptions,
+    headers: { 'Content-Type': 'application/json', ...(headers || {}) }
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
+    if (response.status === 401 && path !== '/login' && path !== '/setup/admin') window.dispatchEvent(new Event('atlas-auth-expired'));
     const error = new Error(data.error || `Request failed (${response.status})`);
     error.status = response.status;
     throw error;
@@ -47,6 +49,7 @@ function maskPhone(phone = '') {
 
 function App() {
   const [stage, setStage] = useState('loading');
+  const [startupAttempt, setStartupAttempt] = useState(0);
   const [toast, setToast] = useState(null);
   const [page, setPage] = useState('leads');
   const [refreshToken, setRefreshToken] = useState(0);
@@ -55,11 +58,13 @@ function App() {
   const [importOpen, setImportOpen] = useState(false);
   const [consentLead, setConsentLead] = useState(null);
   const [confirmSignOut, setConfirmSignOut] = useState(false);
+  const toastTimer = useRef(null);
 
   const refresh = useCallback(() => setRefreshToken((token) => token + 1), []);
   const notify = useCallback((type, message) => {
     setToast({ type, message });
-    window.setTimeout(() => setToast(null), 4400);
+    window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(null), 4400);
   }, []);
 
   useEffect(() => {
@@ -69,19 +74,30 @@ function App() {
       if (needs_setup) return setStage('setup');
       const me = await api('/me');
       if (alive) setStage(me.signed_in ? 'app' : 'login');
-    }).catch(() => alive && setStage('setup'));
+    }).catch(() => alive && setStage('offline'));
     return () => { alive = false; };
+  }, [startupAttempt]);
+
+  useEffect(() => {
+    const onExpired = () => { setStage('login'); setConfirmSignOut(false); setComposerOpen(false); setSelectedIds([]); };
+    window.addEventListener('atlas-auth-expired', onExpired);
+    return () => window.removeEventListener('atlas-auth-expired', onExpired);
   }, []);
 
+  useEffect(() => () => window.clearTimeout(toastTimer.current), []);
+
   async function signOut() {
-    await api('/logout', { method: 'POST', body: '{}' });
-    setStage('login');
-    setPage('leads');
-    setSelectedIds([]);
-    setConfirmSignOut(false);
+    try {
+      await api('/logout', { method: 'POST', body: '{}' });
+      setStage('login');
+      setPage('leads');
+      setSelectedIds([]);
+      setConfirmSignOut(false);
+    } catch (err) { notify('error', err.message); }
   }
 
   if (stage === 'loading') return <div className="loading-screen"><LoaderCircle className="spin" size={24} /><span>Opening Atlas SMS…</span></div>;
+  if (stage === 'offline') return <AuthPage icon={AlertCircle} title="Atlas SMS is unavailable" subtitle="Start the local Atlas API, then try connecting again."><button className="primary-button full-width" onClick={() => { setStage('loading'); setStartupAttempt((attempt) => attempt + 1); }}>Retry connection</button></AuthPage>;
   if (stage === 'setup') return <FirstRun onDone={() => setStage('app')} />;
   if (stage === 'login') return <Login onDone={() => setStage('app')} />;
 
@@ -133,7 +149,7 @@ function App() {
 }
 
 function NavItem({ icon: Icon, label, active, onClick }) {
-  return <button className={`nav-item ${active ? 'active' : ''}`} onClick={onClick}><Icon size={18} strokeWidth={1.8} /><span>{label}</span></button>;
+  return <button className={`nav-item ${active ? 'active' : ''}`} onClick={onClick} aria-label={label} aria-current={active ? 'page' : undefined}><Icon size={18} strokeWidth={1.8} /><span>{label}</span></button>;
 }
 
 function FirstRun({ onDone }) {
@@ -191,28 +207,36 @@ function LeadsPage({ selectedIds, setSelectedIds, onImport, onNewCampaign, onEdi
   const [page, setPage] = useState(1);
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const requestSequence = useRef(0);
   const load = useCallback(async () => {
+    const requestId = ++requestSequence.current;
     setLoading(true);
-    try { setData(await api(`/leads?view=${view}&page=${page}&limit=50&q=${encodeURIComponent(query)}`)); }
-    catch (err) { notify('error', err.message); }
-    finally { setLoading(false); }
+    try {
+      const result = await api(`/leads?view=${view}&page=${page}&limit=50&q=${encodeURIComponent(query)}`);
+      if (requestId === requestSequence.current) setData(result);
+    } catch (err) {
+      if (requestId === requestSequence.current) notify('error', err.message);
+    } finally {
+      if (requestId === requestSequence.current) setLoading(false);
+    }
   }, [view, page, query, notify]);
   useEffect(() => { const timer = window.setTimeout(load, 120); return () => window.clearTimeout(timer); }, [load]);
   const rows = data?.rows || [];
   const selected = new Set(selectedIds);
-  const allVisibleSelected = rows.length > 0 && rows.every((row) => selected.has(row.id));
+  const selectableRows = rows.filter((row) => row.eligibility.eligible);
+  const allVisibleSelected = selectableRows.length > 0 && selectableRows.every((row) => selected.has(row.id));
   const stats = data?.stats || { total: 0, consented: 0, missing_consent: 0, suppressed: 0, eligible: 0 };
   const tabs = [
     ['all', 'All leads', stats.total], ['consented', 'Consented', stats.consented],
     ['missing', 'Missing consent', stats.missing_consent], ['suppressed', 'Suppressed', stats.suppressed]
   ];
   function toggle(id) { setSelectedIds((current) => current.includes(id) ? current.filter((value) => value !== id) : [...current, id]); }
-  function selectPage() { setSelectedIds((current) => allVisibleSelected ? current.filter((id) => !rows.some((row) => row.id === id)) : [...new Set([...current, ...rows.filter((row) => row.eligibility.eligible).map((row) => row.id)])]); }
+  function selectPage() { setSelectedIds((current) => allVisibleSelected ? current.filter((id) => !selectableRows.some((row) => row.id === id)) : [...new Set([...current, ...selectableRows.map((row) => row.id)])]); }
   async function selectAllEligible() {
     try {
       const result = await api(`/leads/eligible-ids?q=${encodeURIComponent(query)}`);
       setSelectedIds(result.ids);
-      notify('success', `${result.ids.length} consented leads selected.${result.capped ? ' Selection is capped at 2,000 leads.' : ''} Daily live-send cap: 100.`);
+      notify('success', `${result.ids.length} eligible leads selected.${result.capped ? ' Selection is capped at 2,000 leads.' : ''} ${result.daily_limit.remaining} live sends remain in this 24-hour window (cap ${result.daily_limit.limit}).`);
     } catch (err) { notify('error', err.message); }
   }
   return <>
@@ -260,15 +284,20 @@ function ImportDialog({ onClose, onImported, notify }) {
   const [mapping, setMapping] = useState({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const requestSequence = useRef(0);
   async function chooseFile(selected) {
+    const requestId = ++requestSequence.current;
     setFile(selected); setPreview(null); setMapping({}); setError('');
     if (!selected) return;
     if (selected.size > 7 * 1024 * 1024) return setError('Choose a CSV smaller than 7 MB.');
-    const text = await selected.text(); setCsvText(text);
     try {
+      const text = await selected.text();
+      if (requestId !== requestSequence.current) return;
+      setCsvText(text);
       const result = await api('/import/preview', { method: 'POST', body: JSON.stringify({ csv_text: text }) });
+      if (requestId !== requestSequence.current) return;
       setPreview(result); setMapping(result.suggested_mapping);
-    } catch (err) { setError(err.message); }
+    } catch (err) { if (requestId === requestSequence.current) setError(err.message || 'Could not read this file.'); }
   }
   async function importFile() {
     setBusy(true); setError('');
@@ -330,19 +359,34 @@ function CampaignComposer({ selectedIds, onClose, onDone, notify }) {
   const [confirmText, setConfirmText] = useState('');
   const [dryRun, setDryRun] = useState(true);
   const [error, setError] = useState('');
+  useEffect(() => { setPreview(null); setConfirmOpen(false); setConfirmText(''); }, [selectedIds]);
   async function checkRecipients() {
     setLoading(true); setError('');
     try { setPreview(await api('/campaigns/preview', { method: 'POST', body: JSON.stringify({ contact_ids: selectedIds, message }) })); }
     catch (err) { setError(err.message); }
     finally { setLoading(false); }
   }
-  async function createCampaign(asDryRun) {
+  async function createCampaign(asDryRun, confirmation = '') {
     setLoading(true); setError('');
+    let created = null;
     try {
-      const created = await api('/campaigns', { method: 'POST', body: JSON.stringify({ name, message, contact_ids: selectedIds }) });
-      const result = await api(`/campaigns/${created.id}/start`, { method: 'POST', body: JSON.stringify({ dry_run: asDryRun, confirmation: `SEND ${created.eligible_count}` }) });
+      const expectedCount = preview?.eligible_count;
+      if (!Number.isInteger(expectedCount)) throw new Error('Check recipients again before creating this campaign.');
+      created = await api('/campaigns', { method: 'POST', body: JSON.stringify({ name, message, contact_ids: selectedIds, expected_count: expectedCount }) });
+      const result = await api(`/campaigns/${created.id}/start`, { method: 'POST', body: JSON.stringify({ dry_run: asDryRun, confirmation }) });
       onDone(asDryRun ? `Dry-run preview saved for ${result.recipient_count} eligible recipients. No SMS was sent.` : `Campaign queued for ${result.recipient_count} consented leads.`);
-    } catch (err) { setError(err.message); notify('error', err.message); }
+    } catch (err) {
+      if (created?.id) {
+        const current = await api('/campaigns').catch(() => null);
+        const saved = current?.campaigns?.find((campaign) => campaign.id === created.id);
+        if (saved && saved.status !== 'draft') {
+          onDone(`Campaign status is ${saved.status}. Check Campaigns before trying again.`);
+          return;
+        }
+        await api(`/campaigns/${created.id}`, { method: 'DELETE' }).catch(() => {});
+      }
+      setError(err.message); notify('error', err.message);
+    }
     finally { setLoading(false); }
   }
   return <aside className="composer-panel">
@@ -371,7 +415,7 @@ function CampaignComposer({ selectedIds, onClose, onDone, notify }) {
     <div className="composer-actions"><button className="secondary-button full-width" disabled={loading || !selectedIds.length || !message.trim()} onClick={checkRecipients}>{loading ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}Check recipients</button>
       {preview && <button className="primary-button full-width" disabled={loading || !preview.eligible_count || !name.trim() || (!dryRun && !preview.daily_limit.ok)} onClick={() => dryRun ? createCampaign(true) : setConfirmOpen(true)}>{loading ? <LoaderCircle className="spin" size={16} /> : dryRun ? <Clipboard size={15} /> : <Send size={15} />}{dryRun ? `Save dry run (${preview.eligible_count})` : `Review live send (${preview.eligible_count})`}</button>}
     </div>
-    {confirmOpen && <LiveConfirm count={preview.eligible_count} value={confirmText} setValue={setConfirmText} onCancel={() => { setConfirmOpen(false); setConfirmText(''); }} onConfirm={() => { setConfirmOpen(false); createCampaign(false); }} />}
+    {confirmOpen && preview && <LiveConfirm count={preview.eligible_count} value={confirmText} setValue={setConfirmText} onCancel={() => { setConfirmOpen(false); setConfirmText(''); }} onConfirm={() => { setConfirmOpen(false); createCampaign(false, confirmText); }} />}
   </aside>;
 }
 
@@ -405,9 +449,17 @@ function ConversationsPage({ notify }) {
   const [selected, setSelected] = useState(null);
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(true);
+  const messageRequestSequence = useRef(0);
   async function load() { setLoading(true); try { const result = await api('/conversations'); setRows(result.conversations); } catch (err) { notify('error', err.message); } finally { setLoading(false); } }
   useEffect(() => { load(); const timer = window.setInterval(load, 6000); return () => window.clearInterval(timer); }, []);
-  useEffect(() => { if (!selected) return; api(`/conversations/${encodeURIComponent(selected.phone)}`).then((result) => setMessages(result.messages)).catch((err) => notify('error', err.message)); }, [selected, notify]);
+  useEffect(() => {
+    const requestId = ++messageRequestSequence.current;
+    if (!selected) { setMessages([]); return; }
+    api(`/conversations/${encodeURIComponent(selected.phone)}`)
+      .then((result) => { if (requestId === messageRequestSequence.current) setMessages(result.messages); })
+      .catch((err) => { if (requestId === messageRequestSequence.current) notify('error', err.message); });
+    return () => { if (requestId === messageRequestSequence.current) messageRequestSequence.current += 1; };
+  }, [selected, notify]);
   return <>
     <div className="page-heading"><div><h1>Conversations</h1><p>Inbound replies from the paired SIM appear here. Opt-out replies suppress the number immediately.</p></div><button className="icon-button" onClick={load} aria-label="Refresh conversations"><LoaderCircle size={16} className={loading ? 'spin' : ''} /></button></div>
     <div className="conversation-layout"><div className="conversation-list">{rows.length ? rows.map((row) => <button key={row.phone} className={`conversation-row ${selected?.phone === row.phone ? 'chosen' : ''}`} onClick={() => setSelected(row)}><span className="conversation-avatar">{(row.name || row.phone).slice(0, 1).toUpperCase()}</span><span className="conversation-copy"><strong>{row.name || row.phone}</strong><small>{row.last_direction === 'inbound' ? 'Reply: ' : 'You: '}{row.last_body}</small></span><span className="conversation-meta"><time>{fmtDate(row.last_at)}</time>{row.is_suppressed ? <span className="mini-suppressed">Suppressed</span> : null}</span></button>) : <EmptyState icon={MessageCircle} title={loading ? 'Loading replies…' : 'No conversations yet'} body="Replies received on the paired phone will be stored locally and shown here." />}</div>
@@ -473,8 +525,27 @@ function EmptyState({ icon: Icon, title, body }) { return <div className="empty-
 function InlineError({ children }) { return <div className="inline-error"><AlertCircle size={15} />{children}</div>; }
 
 function Modal({ title, subtitle, children, onClose, wide = false }) {
-  useEffect(() => { function onKey(event) { if (event.key === 'Escape') onClose(); } window.addEventListener('keydown', onKey); return () => window.removeEventListener('keydown', onKey); }, [onClose]);
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}><section className={`modal ${wide ? 'modal-wide' : ''}`} role="dialog" aria-modal="true" aria-label={title}><header className="modal-header"><div><h2>{title}</h2>{subtitle && <p>{subtitle}</p>}</div><button className="icon-button" onClick={onClose} aria-label="Close dialog"><X size={18} /></button></header>{children}</section></div>;
+  const titleId = useId();
+  const panelRef = useRef(null);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+  useEffect(() => {
+    const previousFocus = document.activeElement;
+    const panel = panelRef.current;
+    const focusable = () => [...(panel?.querySelectorAll('button:not([disabled]), a[href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])') || [])];
+    (panel?.querySelector('[autofocus]') || focusable()[0] || panel)?.focus();
+    function onKey(event) {
+      if (event.key === 'Escape') { event.stopPropagation(); closeRef.current(); return; }
+      if (event.key !== 'Tab') return;
+      const items = focusable();
+      if (!items.length) { event.preventDefault(); panel?.focus(); return; }
+      if (event.shiftKey && document.activeElement === items[0]) { event.preventDefault(); items[items.length - 1].focus(); }
+      else if (!event.shiftKey && document.activeElement === items[items.length - 1]) { event.preventDefault(); items[0].focus(); }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => { window.removeEventListener('keydown', onKey); if (previousFocus instanceof HTMLElement) previousFocus.focus(); };
+  }, []);
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) closeRef.current(); }}><section ref={panelRef} className={`modal ${wide ? 'modal-wide' : ''}`} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}><header className="modal-header"><div><h2 id={titleId}>{title}</h2>{subtitle && <p>{subtitle}</p>}</div><button className="icon-button" onClick={() => closeRef.current()} aria-label="Close dialog"><X size={18} /></button></header>{children}</section></div>;
 }
 
 function ConfirmDialog({ title, body, confirmLabel, onCancel, onConfirm }) {

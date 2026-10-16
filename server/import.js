@@ -1,6 +1,6 @@
 import { parse } from 'csv-parse/sync';
 import { db, finalizeCampaignIfIdle } from './db.js';
-import { createId, normalizePhone, parseConsent } from './core.js';
+import { createId, normalizePhone, parseConsent, validateCsvHeaders } from './core.js';
 
 const ALIASES = {
   name: ['name', 'full name', 'owner name', 'seller name', 'contact name', 'first name'],
@@ -25,7 +25,12 @@ export function parseCsv(csvText) {
     max_record_size: 100_000
   });
   if (!rows.length) return { headers: [], records: [] };
-  const headers = rows[0].map((header) => String(header ?? '').trim());
+  const headers = validateCsvHeaders(rows[0]);
+  for (let index = 1; index < rows.length; index += 1) {
+    if (rows[index].length > headers.length && rows[index].slice(headers.length).some((value) => String(value ?? '').trim())) {
+      throw new Error(`CSV row ${index + 1} has more values than the header row.`);
+    }
+  }
   const records = rows.slice(1).map((cells, index) => ({
     row_number: index + 2,
     values: Object.fromEntries(headers.map((header, i) => [header, String(cells[i] ?? '').trim()]))
@@ -34,7 +39,7 @@ export function parseCsv(csvText) {
 }
 
 export function suggestedMapping(headers) {
-  const normalized = new Map(headers.map((header) => [header.toLowerCase().replace(/[_-]/g, ' ').trim(), header]));
+  const normalized = new Map(headers.map((header) => [header.toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim(), header]));
   return Object.fromEntries(Object.entries(ALIASES).map(([field, aliases]) => {
     const match = aliases.map((alias) => normalized.get(alias)).find(Boolean) || '';
     return [field, match];
@@ -77,7 +82,9 @@ export function importRecords(records, mapping) {
   `);
   const getExisting = db.prepare('SELECT id FROM contacts WHERE phone = ?');
   const addSuppression = db.prepare(`INSERT INTO suppressions (phone, reason, source, created_at)
-    VALUES (?, ?, 'CSV import', ?) ON CONFLICT(phone) DO NOTHING`);
+    VALUES (?, ?, 'CSV import', ?) ON CONFLICT(phone) DO UPDATE SET
+      reason = excluded.reason, source = excluded.source, created_at = excluded.created_at,
+      released_at = NULL, release_evidence = ''`);
   const updateRevoked = db.prepare(`UPDATE contacts SET consent_status = 'revoked', updated_at = ? WHERE phone = ?`);
   const inserted = new Set();
   const updated = new Set();
@@ -95,7 +102,7 @@ export function importRecords(records, mapping) {
       const source = read(record, mapping, 'consent_source');
       const evidence = read(record, mapping, 'consent_evidence');
       const consentAt = parseDate(read(record, mapping, 'consent_at'));
-      const documented = consent === 'consented' && source && evidence && consentAt;
+      const documented = consent === 'consented' && source && evidence && consentAt && Date.parse(consentAt) <= Date.now();
       const status = documented ? 'consented' : 'unknown';
       const values = {
         id: existing?.id || createId(),

@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import session from 'express-session';
 import { db, finalizeCampaignIfIdle, getSetting, setSetting } from './db.js';
-import { cleanMessage, createId, eligibility, hashSecret, isLoopbackAddress, isOptOutMessage, normalizePhone, renderMessage, safeEqual } from './core.js';
+import { cleanMessage, createId, eligibility, escapeLike, hashSecret, isLoopbackAddress, isOptOutMessage, isPrivateNetworkAddress, normalizePhone, renderMessage, safeEqual, smsSegmentCount } from './core.js';
 import { importRecords, parseCsv, suggestedMapping } from './import.js';
 
 const app = express();
@@ -19,7 +19,11 @@ let activePairCodeExpires = 0;
 let lastJobClaimAt = 0;
 
 app.disable('x-powered-by');
-app.use(express.json({ limit: '8mb' }));
+// JSON escaping can nearly double a valid 7 MB CSV before it reaches this parser.
+app.use('/api', (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
+app.use('/api/import', express.json({ limit: '20mb' }));
+app.use('/api/bridge', express.json({ limit: '32kb' }));
+app.use('/api', express.json({ limit: '256kb' }));
 app.use(session({
   name: 'atlas.sid',
   secret: process.env.ATLAS_SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
@@ -40,13 +44,43 @@ function replyError(res, status, message) {
 }
 
 function requireAdmin(req, res, next) {
+  if (!isLoopbackRequest(req)) return replyError(res, 403, 'Open the Atlas dashboard on the computer running it.');
   if (req.session?.adminId === 1) return next();
   return replyError(res, 401, 'Sign in to continue.');
+}
+
+function requireLocalBrowser(req, res, next) {
+  if (isLoopbackRequest(req)) return next();
+  return replyError(res, 403, 'Open the Atlas dashboard on the computer running it.');
+}
+
+function requireLocalBridgeNetwork(req, res, next) {
+  if (isPrivateNetworkAddress(req.socket.remoteAddress || req.ip || '')) return next();
+  return replyError(res, 403, 'The SMS bridge must connect from a local network.');
+}
+
+function establishAdminSession(req) {
+  return new Promise((resolve, reject) => {
+    req.session.regenerate((regenerateError) => {
+      if (regenerateError) return reject(regenerateError);
+      req.session.adminId = 1;
+      req.session.save((saveError) => saveError ? reject(saveError) : resolve());
+    });
+  });
 }
 
 function isLoopbackRequest(req) {
   return isLoopbackAddress(req.socket.remoteAddress || req.ip || '');
 }
+
+const documentedConsentSql = `consent_status = 'consented' AND consent_source <> '' AND consent_evidence <> ''
+  AND julianday(consent_at) IS NOT NULL AND julianday(consent_at) <= julianday('now')`;
+const validPhoneSql = `length(phone) BETWEEN 9 AND 16 AND substr(phone, 1, 1) = '+'
+  AND substr(phone, 2, 1) GLOB '[1-9]' AND substr(phone, 2) NOT LIKE '%+%'
+  AND phone NOT GLOB '*[^+0-9]*'`;
+const leadSearchSql = `(name LIKE ? ESCAPE char(92) OR phone LIKE ? ESCAPE char(92)
+  OR property_address LIKE ? ESCAPE char(92) OR city LIKE ? ESCAPE char(92)
+  OR state LIKE ? ESCAPE char(92) OR zip LIKE ? ESCAPE char(92))`;
 
 function newPasswordHash(password, salt = crypto.randomBytes(16).toString('hex')) {
   const digest = crypto.scryptSync(password, salt, 64).toString('hex');
@@ -81,18 +115,22 @@ function importData(csvText) {
   if (Buffer.byteLength(csvText, 'utf8') > 7_000_000) throw new Error('CSV files must be smaller than 7 MB.');
   const parsed = parseCsv(csvText);
   if (parsed.headers.length < 2) throw new Error('The CSV needs a header row and at least one data column.');
+  if (!parsed.records.length) throw new Error('The CSV needs at least one lead row.');
+  if (parsed.records.length > 50_000) throw new Error('A CSV import can contain at most 50,000 lead rows.');
   return parsed;
 }
 
 function getStats() {
   const total = db.prepare('SELECT COUNT(*) AS count FROM contacts').get().count;
-  const consented = db.prepare(`SELECT COUNT(*) AS count FROM contacts
-    WHERE consent_status = 'consented' AND consent_source <> '' AND consent_evidence <> '' AND consent_at IS NOT NULL`).get().count;
+  const consented = db.prepare(`SELECT COUNT(*) AS count FROM contacts WHERE ${documentedConsentSql}`).get().count;
   const suppressed = db.prepare('SELECT COUNT(*) AS count FROM suppressions WHERE released_at IS NULL').get().count;
-  const validPhones = db.prepare(`SELECT COUNT(*) AS count FROM contacts c
-    WHERE c.consent_status = 'consented' AND c.consent_source <> '' AND c.consent_evidence <> '' AND c.consent_at IS NOT NULL
-    AND c.phone GLOB '+[1-9]*' AND NOT EXISTS (SELECT 1 FROM suppressions s WHERE s.phone = c.phone AND s.released_at IS NULL)`).get().count;
-  return { total, consented, missing_consent: Math.max(0, total - consented - suppressed), suppressed, eligible: validPhones };
+  const missing = db.prepare(`SELECT COUNT(*) AS count FROM contacts
+    WHERE NOT (${documentedConsentSql})
+      AND NOT EXISTS (SELECT 1 FROM suppressions s WHERE s.phone = contacts.phone AND s.released_at IS NULL)`).get().count;
+  const eligible = db.prepare(`SELECT COUNT(*) AS count FROM contacts
+    WHERE ${documentedConsentSql} AND ${validPhoneSql}
+      AND NOT EXISTS (SELECT 1 FROM suppressions s WHERE s.phone = contacts.phone AND s.released_at IS NULL)`).get().count;
+  return { total, consented, missing_consent: missing, suppressed, eligible };
 }
 
 function mapContact(contact) {
@@ -109,8 +147,9 @@ function checkDailyLimit(count) {
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   const used = db.prepare(`SELECT COUNT(*) AS count FROM campaign_recipients cr
     JOIN campaigns c ON c.id = cr.campaign_id
-    WHERE cr.created_at >= ? AND cr.status IN ('queued', 'sending', 'sent', 'failed', 'unknown')
-      AND c.status IN ('sending', 'completed', 'partial')`).get(since).count;
+    WHERE (cr.status IN ('sending', 'sent', 'failed', 'unknown')
+        AND COALESCE(cr.sent_at, cr.started_at, cr.created_at) >= ?)
+      OR (cr.status = 'queued' AND c.status = 'sending')`).get(since).count;
   if (used + count > limit) return { ok: false, limit, used, remaining: Math.max(0, limit - used) };
   return { ok: true, limit, used, remaining: limit - used };
 }
@@ -143,6 +182,7 @@ function recipientPayload(ids, template) {
     const decision = eligibility(contact, contact.is_suppressed);
     const message = renderMessage(template, contact, businessName);
     if (message.length > 480) decision.reasons.push('Personalized message exceeds 480 characters');
+    if (smsSegmentCount(message) > 6) decision.reasons.push('Personalized message exceeds six carrier SMS segments');
     if (!decision.eligible || decision.reasons.length) blocked.push({ id: contact.id, name: contact.name, phone: contact.phone, reasons: decision.reasons });
     else eligibleContacts.push({ contact, message });
   }
@@ -150,23 +190,24 @@ function recipientPayload(ids, template) {
 }
 
 const publicApi = express.Router();
+publicApi.use(requireLocalBrowser);
 publicApi.get('/setup/status', (_req, res) => res.json({ needs_setup: !db.prepare('SELECT id FROM admins WHERE id = 1').get() }));
-publicApi.post('/setup/admin', asyncRoute((req, res) => {
-  if (!isLoopbackRequest(req)) return replyError(res, 403, 'Create the first password from the computer running Atlas SMS.');
+publicApi.post('/setup/admin', asyncRoute(async (req, res) => {
   if (db.prepare('SELECT id FROM admins WHERE id = 1').get()) return replyError(res, 409, 'The first password is already set.');
   const password = String(req.body?.password ?? '');
-  if (password.length < 12) return replyError(res, 400, 'Use a password with at least 12 characters.');
+  if (password.length < 12 || password.length > 256) return replyError(res, 400, 'Use a password between 12 and 256 characters.');
   const { salt, digest } = newPasswordHash(password);
   db.prepare('INSERT INTO admins (id, password_salt, password_hash, created_at) VALUES (1, ?, ?, ?)').run(salt, digest, nowIso());
-  req.session.adminId = 1;
+  await establishAdminSession(req);
   return res.json({ ok: true });
 }));
-publicApi.post('/login', asyncRoute((req, res) => {
+publicApi.post('/login', asyncRoute(async (req, res) => {
   const ip = req.socket.remoteAddress || 'unknown';
   const bucket = loginAttempts.get(ip) || { count: 0, until: 0 };
   if (bucket.until > Date.now() && bucket.count >= 10) return replyError(res, 429, 'Too many attempts. Wait 10 minutes and try again.');
   const admin = db.prepare('SELECT * FROM admins WHERE id = 1').get();
-  const valid = admin && verifyPassword(String(req.body?.password ?? ''), admin.password_salt, admin.password_hash);
+  const password = String(req.body?.password ?? '');
+  const valid = admin && password.length <= 256 && verifyPassword(password, admin.password_salt, admin.password_hash);
   if (!valid) {
     const failed = bucket.until < Date.now() ? { count: 0, until: Date.now() + 10 * 60 * 1000 } : bucket;
     failed.count += 1;
@@ -174,13 +215,15 @@ publicApi.post('/login', asyncRoute((req, res) => {
     return replyError(res, 401, 'That password did not match.');
   }
   loginAttempts.delete(ip);
-  req.session.adminId = 1;
+  await establishAdminSession(req);
   return res.json({ ok: true });
 }));
-publicApi.post('/logout', (req, res) => req.session.destroy(() => res.json({ ok: true })));
+publicApi.post('/logout', (req, res) => req.session.destroy((error) => {
+  res.clearCookie('atlas.sid', { path: '/', httpOnly: true, sameSite: 'strict', secure: false });
+  if (error) return replyError(res, 500, 'Could not end the local session.');
+  return res.json({ ok: true });
+}));
 publicApi.get('/me', (req, res) => res.json({ signed_in: req.session?.adminId === 1 }));
-app.use('/api', publicApi);
-
 const bridgeApi = express.Router();
 function requireBridge(req, res, next) {
   const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
@@ -191,11 +234,11 @@ function requireBridge(req, res, next) {
   next();
 }
 
-bridgeApi.post('/pair', (req, res) => {
+bridgeApi.post('/pair', requireLocalBridgeNetwork, (req, res) => {
   const ip = req.socket.remoteAddress || 'unknown';
   const attempts = pairAttempts.get(ip) || { count: 0, until: 0 };
   if (attempts.until > Date.now() && attempts.count >= 8) return replyError(res, 429, 'Too many pairing attempts. Ask Atlas SMS for a new code.');
-  const code = String(req.body?.code ?? '').replace(/\D/g, '').slice(0, 6);
+  const code = String(req.body?.code ?? '').replace(/\D/g, '');
   if (!activePairCode || Date.now() > activePairCodeExpires || !safeEqual(code, activePairCode)) {
     const failed = attempts.until < Date.now() ? { count: 0, until: Date.now() + 10 * 60 * 1000 } : attempts;
     failed.count += 1;
@@ -207,16 +250,18 @@ bridgeApi.post('/pair', (req, res) => {
   const token = crypto.randomBytes(32).toString('base64url');
   const id = createId();
   const now = nowIso();
-  db.prepare('UPDATE bridge_devices SET active = 0 WHERE active = 1').run();
-  db.prepare(`INSERT INTO bridge_devices (id, name, token_hash, phone_number, last_seen, created_at)
-    VALUES (?, ?, ?, ?, NULL, ?)`).run(id, name, hashSecret(token), phoneNumber, now);
+  db.transaction(() => {
+    db.prepare('UPDATE bridge_devices SET active = 0 WHERE active = 1').run();
+    db.prepare(`INSERT INTO bridge_devices (id, name, token_hash, phone_number, last_seen, created_at)
+      VALUES (?, ?, ?, ?, NULL, ?)`).run(id, name, hashSecret(token), phoneNumber, now);
+  })();
   activePairCode = null;
   activePairCodeExpires = 0;
   pairAttempts.delete(ip);
   return res.json({ ok: true, device_id: id, token, message: 'Paired. Keep this token private; it is stored only on this phone and as a hash on the computer.' });
 });
 
-bridgeApi.use(requireBridge);
+bridgeApi.use(requireLocalBridgeNetwork, requireBridge);
 bridgeApi.post('/heartbeat', (req, res) => {
   const phoneNumber = normalizePhone(req.body?.phone_number ?? '') || req.bridgeDevice.phone_number;
   db.prepare('UPDATE bridge_devices SET last_seen = ?, phone_number = ? WHERE id = ?').run(nowIso(), phoneNumber, req.bridgeDevice.id);
@@ -251,49 +296,59 @@ bridgeApi.get('/jobs/next', (req, res) => {
   return res.json({ job });
 });
 bridgeApi.post('/jobs/:id/result', (req, res) => {
-  const recipient = db.prepare('SELECT * FROM campaign_recipients WHERE id = ?').get(req.params.id);
-  if (!recipient) return replyError(res, 404, 'Message job not found.');
-  if (recipient.status === 'sent' || recipient.status === 'failed') return res.json({ ok: true, status: recipient.status });
-  if (recipient.status !== 'sending' && recipient.status !== 'unknown') return replyError(res, 409, 'This message is no longer in progress.');
-  const status = req.body?.success === true ? 'sent' : 'failed';
-  const error = status === 'failed' ? String(req.body?.error ?? 'The Android SIM could not send this message.').slice(0, 240) : '';
-  const sentAt = nowIso();
-  db.prepare(`UPDATE campaign_recipients SET status = ?, error = ?, sent_at = ? WHERE id = ?`).run(status, error, sentAt, recipient.id);
-  db.prepare(`INSERT INTO messages (id, phone, direction, body, contact_id, campaign_id, recipient_id, status, received_at)
-    VALUES (?, ?, 'outbound', ?, ?, ?, ?, ?, ?)`).run(createId(), recipient.phone, recipient.rendered_message, recipient.contact_id, recipient.campaign_id, recipient.id, status, sentAt);
-  finalizeCampaignIfIdle(recipient.campaign_id);
-  return res.json({ ok: true, status });
+  const result = db.transaction(() => {
+    const recipient = db.prepare('SELECT * FROM campaign_recipients WHERE id = ?').get(req.params.id);
+    if (!recipient) return { error: 404, message: 'Message job not found.' };
+    if (recipient.status === 'sent' || recipient.status === 'failed') return { status: recipient.status };
+    if (recipient.status !== 'sending' && recipient.status !== 'unknown') return { error: 409, message: 'This message is no longer in progress.' };
+    const status = req.body?.success === true ? 'sent' : 'failed';
+    const error = status === 'failed' ? String(req.body?.error ?? 'The Android SIM could not send this message.').slice(0, 240) : '';
+    const sentAt = nowIso();
+    db.prepare(`UPDATE campaign_recipients SET status = ?, error = ?, sent_at = ? WHERE id = ?`).run(status, error, sentAt, recipient.id);
+    db.prepare(`INSERT INTO messages (id, phone, direction, body, contact_id, campaign_id, recipient_id, status, received_at)
+      VALUES (?, ?, 'outbound', ?, ?, ?, ?, ?, ?)`).run(createId(), recipient.phone, recipient.rendered_message, recipient.contact_id, recipient.campaign_id, recipient.id, status, sentAt);
+    finalizeCampaignIfIdle(recipient.campaign_id);
+    return { status };
+  })();
+  if (result.error) return replyError(res, result.error, result.message);
+  return res.json({ ok: true, status: result.status });
 });
 bridgeApi.post('/inbound', (req, res) => {
   const phone = normalizePhone(req.body?.phone ?? '');
   const body = cleanMessage(req.body?.body ?? '').slice(0, 1600);
+  const sourceId = String(req.body?.id ?? '').trim();
+  if (sourceId && !/^[A-Za-z0-9_-]{8,100}$/.test(sourceId)) return replyError(res, 400, 'Inbound message id is invalid.');
   if (!phone || !body) return replyError(res, 400, 'A valid sender phone and message body are required.');
   const now = nowIso();
-  const contact = db.prepare('SELECT * FROM contacts WHERE phone = ?').get(phone);
-  // Do not pull unrelated personal SMS from the paired phone into the CRM.
-  if (!contact) return res.json({ ok: true, ignored: true });
-  db.prepare(`INSERT INTO messages (id, phone, direction, body, contact_id, status, received_at)
-    VALUES (?, ?, 'inbound', ?, ?, 'received', ?)`).run(createId(), phone, body, contact.id, now);
-  if (isOptOutMessage(body)) {
+  const optedOut = isOptOutMessage(body);
+  const result = db.transaction(() => {
+    const contact = db.prepare('SELECT * FROM contacts WHERE phone = ?').get(phone);
+    if (contact) {
+      db.prepare(`INSERT OR IGNORE INTO messages (id, source_id, phone, direction, body, contact_id, status, received_at)
+        VALUES (?, ?, ?, 'inbound', ?, ?, 'received', ?)`).run(createId(), sourceId || null, phone, body, contact.id, now);
+    }
+    if (!optedOut) return { ignored: !contact, opted_out: false };
     const affectedCampaigns = db.prepare(`SELECT DISTINCT campaign_id FROM campaign_recipients WHERE phone = ? AND status = 'queued'`).all(phone).map((row) => row.campaign_id);
     db.prepare(`INSERT INTO suppressions (phone, reason, source, created_at)
       VALUES (?, ?, 'Inbound SMS', ?) ON CONFLICT(phone) DO UPDATE SET
       reason = excluded.reason, source = excluded.source, created_at = excluded.created_at, released_at = NULL, release_evidence = ''`)
       .run(phone, `Opt-out reply: ${body.slice(0, 80)}`, now);
-    db.prepare(`UPDATE contacts SET consent_status = 'revoked', updated_at = ? WHERE phone = ?`).run(now, phone);
+    if (contact) db.prepare(`UPDATE contacts SET consent_status = 'revoked', updated_at = ? WHERE phone = ?`).run(now, phone);
     db.prepare(`UPDATE campaign_recipients SET status = 'cancelled', error = 'Suppressed after opt-out reply'
       WHERE phone = ? AND status = 'queued'`).run(phone);
     for (const campaignId of affectedCampaigns) finalizeCampaignIfIdle(campaignId);
-    // No further message is sent. The suppression takes effect before the webhook responds.
-    return res.json({ ok: true, opted_out: true });
-  }
-  return res.json({ ok: true, opted_out: false });
+    return { ignored: !contact, opted_out: true };
+  })();
+  return res.json({ ok: true, ...result });
 });
 bridgeApi.delete('/device', (req, res) => {
   db.prepare('UPDATE bridge_devices SET active = 0 WHERE id = ?').run(req.bridgeDevice.id);
   return res.json({ ok: true });
 });
 app.use('/api/bridge', bridgeApi);
+// Mount the phone bridge before the browser-only API guard. The phone is a
+// private-network client, while dashboard requests must come from loopback.
+app.use('/api', publicApi);
 
 const adminApi = express.Router();
 adminApi.use(requireAdmin);
@@ -314,12 +369,14 @@ adminApi.get('/leads', (req, res) => {
   const clauses = [];
   const params = [];
   if (query) {
-    clauses.push('(name LIKE ? OR phone LIKE ? OR property_address LIKE ? OR city LIKE ? OR state LIKE ? OR zip LIKE ?)');
-    const q = `%${query}%`;
+    clauses.push(leadSearchSql);
+    const q = `%${escapeLike(query)}%`;
     params.push(q, q, q, q, q, q);
   }
-  if (view === 'consented') clauses.push(`consent_status = 'consented' AND consent_source <> '' AND consent_evidence <> '' AND consent_at IS NOT NULL`);
-  if (view === 'missing') clauses.push(`consent_status <> 'consented' OR consent_source = '' OR consent_evidence = '' OR consent_at IS NULL`);
+  if (view === 'consented') clauses.push(`(${documentedConsentSql})`);
+  if (view === 'missing') clauses.push(`NOT (${documentedConsentSql}) AND NOT EXISTS (
+    SELECT 1 FROM suppressions s WHERE s.phone = contacts.phone AND s.released_at IS NULL
+  )`);
   if (view === 'suppressed') clauses.push(`EXISTS (SELECT 1 FROM suppressions s WHERE s.phone = contacts.phone AND s.released_at IS NULL)`);
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const total = db.prepare(`SELECT COUNT(*) AS count FROM contacts ${where}`).get(...params).count;
@@ -330,16 +387,18 @@ adminApi.get('/leads', (req, res) => {
 
 adminApi.get('/leads/eligible-ids', (req, res) => {
   const query = String(req.query.q ?? '').trim().slice(0, 120);
-  const clauses = [`consent_status = 'consented'`, `consent_source <> ''`, `consent_evidence <> ''`, `consent_at IS NOT NULL`];
+  const clauses = [`(${documentedConsentSql})`];
   const params = [];
   if (query) {
-    clauses.push('(name LIKE ? OR phone LIKE ? OR property_address LIKE ? OR city LIKE ? OR state LIKE ? OR zip LIKE ?)');
-    const q = `%${query}%`;
+    clauses.push(leadSearchSql);
+    const q = `%${escapeLike(query)}%`;
     params.push(q, q, q, q, q, q);
   }
-  const rows = db.prepare(`SELECT * FROM contacts WHERE ${clauses.join(' AND ')} ORDER BY updated_at DESC LIMIT 2000`).all(...params);
-  const ids = rows.filter((contact) => eligibility({ ...contact, is_suppressed: phoneSuppressed(contact.phone) }, phoneSuppressed(contact.phone)).eligible).map((contact) => contact.id);
-  return res.json({ ids, capped: rows.length === 2000 });
+  clauses.push(validPhoneSql);
+  clauses.push(`NOT EXISTS (SELECT 1 FROM suppressions s WHERE s.phone = contacts.phone AND s.released_at IS NULL)`);
+  const rows = db.prepare(`SELECT * FROM contacts WHERE ${clauses.join(' AND ')} ORDER BY updated_at DESC LIMIT 2001`).all(...params);
+  const capped = rows.length > 2000;
+  return res.json({ ids: rows.slice(0, 2000).map((contact) => contact.id), capped, daily_limit: checkDailyLimit(0) });
 });
 
 adminApi.get('/leads/:id', (req, res) => {
@@ -412,6 +471,10 @@ adminApi.post('/campaigns', (req, res) => {
   if (template.length > 480) return replyError(res, 400, 'Keep the template under 480 characters.');
   const { eligibleContacts, blocked } = recipientPayload(ids, template);
   if (!eligibleContacts.length) return replyError(res, 400, 'No selected leads have complete consent records and valid, unsuppressed numbers.');
+  const expectedCount = Number(req.body?.expected_count);
+  if (!Number.isInteger(expectedCount) || expectedCount !== eligibleContacts.length) {
+    return replyError(res, 409, 'Recipient eligibility changed. Review the current recipient count before creating the campaign.');
+  }
   const id = createId();
   const now = nowIso();
   const transaction = db.transaction(() => {
@@ -423,6 +486,14 @@ adminApi.post('/campaigns', (req, res) => {
   });
   transaction();
   return res.status(201).json({ id, name, status: 'draft', eligible_count: eligibleContacts.length, blocked_count: blocked.length, blocked, daily_limit: checkDailyLimit(eligibleContacts.length) });
+});
+
+adminApi.delete('/campaigns/:id', (req, res) => {
+  const campaign = db.prepare('SELECT status FROM campaigns WHERE id = ?').get(req.params.id);
+  if (!campaign) return replyError(res, 404, 'Campaign not found.');
+  if (campaign.status !== 'draft') return replyError(res, 409, 'Only an unstarted draft can be removed.');
+  db.prepare(`DELETE FROM campaigns WHERE id = ? AND status = 'draft'`).run(req.params.id);
+  return res.json({ ok: true });
 });
 
 adminApi.post('/campaigns/:id/start', (req, res) => {
@@ -444,6 +515,7 @@ adminApi.post('/campaigns/:id/start', (req, res) => {
   const cap = checkDailyLimit(recipients.length);
   if (!cap.ok) return replyError(res, 429, `Daily send limit reached. ${cap.remaining} messages remain in the current 24-hour window.`);
   const now = nowIso();
+  let queuedRecipientCount = 0;
   const transaction = db.transaction(() => {
     for (const recipient of recipients) {
       const contact = getContactById(recipient.contact_id);
@@ -453,6 +525,7 @@ adminApi.post('/campaigns/:id/start', (req, res) => {
     }
     const remaining = db.prepare(`SELECT COUNT(*) AS count FROM campaign_recipients WHERE campaign_id = ? AND status = 'queued'`).get(campaign.id).count;
     if (!remaining) throw new Error('All recipients became ineligible before sending.');
+    queuedRecipientCount = remaining;
     db.prepare(`UPDATE campaigns SET status = 'sending', started_at = ?, dry_run = 0 WHERE id = ?`).run(now, campaign.id);
   });
   try {
@@ -460,16 +533,18 @@ adminApi.post('/campaigns/:id/start', (req, res) => {
   } catch (error) {
     return replyError(res, 409, error.message);
   }
-  return res.json({ ok: true, status: 'sending', recipient_count: recipients.length });
+  return res.json({ ok: true, status: 'sending', recipient_count: queuedRecipientCount });
 });
 
 adminApi.post('/campaigns/:id/cancel', (req, res) => {
   const campaign = db.prepare('SELECT * FROM campaigns WHERE id = ?').get(req.params.id);
   if (!campaign) return replyError(res, 404, 'Campaign not found.');
   const now = nowIso();
-  db.prepare(`UPDATE campaign_recipients SET status = 'cancelled', error = 'Cancelled by user'
-    WHERE campaign_id = ? AND status = 'queued'`).run(campaign.id);
-  db.prepare(`UPDATE campaigns SET status = 'cancelled', finished_at = ? WHERE id = ? AND status IN ('draft', 'sending')`).run(now, campaign.id);
+  db.transaction(() => {
+    db.prepare(`UPDATE campaign_recipients SET status = 'cancelled', error = 'Cancelled by user'
+      WHERE campaign_id = ? AND status = 'queued'`).run(campaign.id);
+    db.prepare(`UPDATE campaigns SET status = 'cancelled', finished_at = ? WHERE id = ? AND status IN ('draft', 'sending')`).run(now, campaign.id);
+  })();
   return res.json({ ok: true });
 });
 
@@ -484,9 +559,9 @@ adminApi.get('/conversations', (_req, res) => {
   return res.json({ conversations });
 });
 adminApi.get('/conversations/:phone', (req, res) => {
-  const phone = normalizePhone(decodeURIComponent(req.params.phone));
+  const phone = normalizePhone(req.params.phone);
   if (!phone) return replyError(res, 400, 'Invalid phone number.');
-  const messages = db.prepare('SELECT * FROM messages WHERE phone = ? ORDER BY received_at ASC LIMIT 500').all(phone);
+  const messages = db.prepare('SELECT * FROM messages WHERE phone = ? ORDER BY received_at DESC LIMIT 500').all(phone).reverse();
   return res.json({ messages });
 });
 
@@ -501,30 +576,33 @@ adminApi.post('/suppressions', (req, res) => {
   if (!phone || !reason) return replyError(res, 400, 'Enter a valid phone number and a reason.');
   const now = nowIso();
   const contact = db.prepare('SELECT * FROM contacts WHERE phone = ?').get(phone);
-  if (!contact) db.prepare(`INSERT INTO contacts (id, phone, consent_status, created_at, updated_at) VALUES (?, ?, 'revoked', ?, ?)`)
-    .run(createId(), phone, now, now);
-  else db.prepare(`UPDATE contacts SET consent_status = 'revoked', updated_at = ? WHERE phone = ?`).run(now, phone);
-  db.prepare(`INSERT INTO suppressions (phone, reason, source, created_at) VALUES (?, ?, 'Manual suppression', ?)
-    ON CONFLICT(phone) DO UPDATE SET reason = excluded.reason, source = excluded.source, created_at = excluded.created_at, released_at = NULL, release_evidence = ''`)
-    .run(phone, reason, now);
-  const affectedCampaigns = db.prepare(`SELECT DISTINCT campaign_id FROM campaign_recipients WHERE phone = ? AND status = 'queued'`).all(phone).map((row) => row.campaign_id);
-  db.prepare(`UPDATE campaign_recipients SET status = 'cancelled', error = 'Added to suppression list'
-    WHERE phone = ? AND status = 'queued'`).run(phone);
-  for (const campaignId of affectedCampaigns) finalizeCampaignIfIdle(campaignId);
+  db.transaction(() => {
+    if (!contact) db.prepare(`INSERT INTO contacts (id, phone, consent_status, created_at, updated_at) VALUES (?, ?, 'revoked', ?, ?)`).run(createId(), phone, now, now);
+    else db.prepare(`UPDATE contacts SET consent_status = 'revoked', updated_at = ? WHERE phone = ?`).run(now, phone);
+    db.prepare(`INSERT INTO suppressions (phone, reason, source, created_at) VALUES (?, ?, 'Manual suppression', ?)
+      ON CONFLICT(phone) DO UPDATE SET reason = excluded.reason, source = excluded.source, created_at = excluded.created_at, released_at = NULL, release_evidence = ''`)
+      .run(phone, reason, now);
+    const affectedCampaigns = db.prepare(`SELECT DISTINCT campaign_id FROM campaign_recipients WHERE phone = ? AND status = 'queued'`).all(phone).map((row) => row.campaign_id);
+    db.prepare(`UPDATE campaign_recipients SET status = 'cancelled', error = 'Added to suppression list'
+      WHERE phone = ? AND status = 'queued'`).run(phone);
+    for (const campaignId of affectedCampaigns) finalizeCampaignIfIdle(campaignId);
+  })();
   return res.status(201).json({ ok: true, phone });
 });
 adminApi.post('/suppressions/:phone/release', (req, res) => {
-  const phone = normalizePhone(decodeURIComponent(req.params.phone));
+  const phone = normalizePhone(req.params.phone);
   const evidence = String(req.body?.new_consent_evidence ?? '').trim().slice(0, 500);
   const source = String(req.body?.new_consent_source ?? '').trim().slice(0, 180);
   const date = new Date(String(req.body?.new_consent_at ?? ''));
-  if (!phone || !source || !evidence || Number.isNaN(date.getTime())) return replyError(res, 400, 'Document new consent source, date, and evidence before releasing suppression.');
+  if (!phone || !source || !evidence || Number.isNaN(date.getTime()) || date.getTime() > Date.now()) return replyError(res, 400, 'Document a valid, non-future consent source, date, and evidence before releasing suppression.');
   const now = nowIso();
   const exists = db.prepare('SELECT phone FROM suppressions WHERE phone = ? AND released_at IS NULL').get(phone);
   if (!exists) return replyError(res, 404, 'This phone number is not suppressed.');
-  db.prepare(`UPDATE suppressions SET released_at = ?, release_evidence = ? WHERE phone = ?`).run(now, `New consent (${source}, ${date.toISOString()}): ${evidence}`, phone);
-  db.prepare(`UPDATE contacts SET consent_status = 'consented', consent_source = ?, consent_evidence = ?, consent_at = ?, updated_at = ? WHERE phone = ?`)
-    .run(source, evidence, date.toISOString(), now, phone);
+  db.transaction(() => {
+    db.prepare(`UPDATE suppressions SET released_at = ?, release_evidence = ? WHERE phone = ?`).run(now, `New consent (${source}, ${date.toISOString()}): ${evidence}`, phone);
+    db.prepare(`UPDATE contacts SET consent_status = 'consented', consent_source = ?, consent_evidence = ?, consent_at = ?, updated_at = ? WHERE phone = ?`)
+      .run(source, evidence, date.toISOString(), now, phone);
+  })();
   return res.json({ ok: true });
 });
 
@@ -562,13 +640,14 @@ function getPrimaryLanAddress() {
   const interfaces = os.networkInterfaces();
   for (const entries of Object.values(interfaces)) {
     for (const entry of entries || []) {
-      if (entry.family === 'IPv4' && !entry.internal) return entry.address;
+      if (entry.family === 'IPv4' && !entry.internal && isPrivateNetworkAddress(entry.address) && !isLoopbackAddress(entry.address)) return entry.address;
     }
   }
   return '127.0.0.1';
 }
 
 if (process.env.NODE_ENV === 'production') {
+  app.use((req, res, next) => isLoopbackRequest(req) ? next() : replyError(res, 403, 'Open the Atlas dashboard on the computer running it.'));
   app.use(express.static(path.join(root, 'dist')));
   app.get('/{*path}', (_req, res) => res.sendFile(path.join(root, 'dist', 'index.html')));
 } else {
@@ -576,6 +655,8 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 app.use((error, _req, res, _next) => {
+  if (error?.type === 'entity.parse.failed') return replyError(res, 400, 'Request body is not valid JSON.');
+  if (error?.type === 'entity.too.large') return replyError(res, 413, 'Request is too large.');
   console.error(error);
   return replyError(res, 500, 'Something went wrong. Check the Atlas SMS server log.');
 });

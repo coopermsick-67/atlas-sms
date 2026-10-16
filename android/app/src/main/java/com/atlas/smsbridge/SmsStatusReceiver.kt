@@ -14,6 +14,7 @@ class SmsStatusReceiver : BroadcastReceiver() {
         val jobId = intent.getStringExtra(BridgeService.EXTRA_JOB_ID) ?: return
         val base = intent.getStringExtra(BridgeService.EXTRA_SERVER_URL) ?: return
         val token = intent.getStringExtra(BridgeService.EXTRA_TOKEN) ?: return
+        val phone = intent.getStringExtra(BridgeService.EXTRA_PHONE).orEmpty()
         val index = intent.getIntExtra(BridgeService.EXTRA_SEGMENT_INDEX, 0)
         val count = intent.getIntExtra(BridgeService.EXTRA_SEGMENT_COUNT, 1)
         val success = resultCode == Activity.RESULT_OK
@@ -27,6 +28,7 @@ class SmsStatusReceiver : BroadcastReceiver() {
         if (done < count) return
         val error = if (failures > 0) "Android SMS send failed (result ${resultCode}, segment ${index + 1}/$count)." else ""
         prefs.edit().remove(doneKey).remove(failKey).apply()
+        if (phone.isNotBlank()) BridgeStore.finishOutbound(context, phone, failures == 0)
         Thread {
             try {
                 val connection = (URL("$base/api/bridge/jobs/$jobId/result").openConnection() as HttpURLConnection).apply {
@@ -37,7 +39,7 @@ class SmsStatusReceiver : BroadcastReceiver() {
                 connection.outputStream.use { it.write(JSONObject().put("success", failures == 0).put("error", error).toString().toByteArray()) }
                 connection.inputStream.close()
             } catch (_: Exception) { }
-            finally { prefs.edit().remove("inflight_job").remove("inflight_started_at").apply() }
+            finally { BridgeStore.clearInflightIfMatches(context, jobId) }
         }.start()
     }
 }

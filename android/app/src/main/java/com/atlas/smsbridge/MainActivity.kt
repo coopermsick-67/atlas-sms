@@ -18,7 +18,6 @@ import android.widget.ScrollView
 import android.widget.TextView
 import org.json.JSONObject
 import java.net.HttpURLConnection
-import java.net.Inet4Address
 import java.net.URL
 import java.util.concurrent.Executors
 
@@ -171,7 +170,8 @@ class MainActivity : Activity() {
                 connection.inputStream.close()
             } catch (_: Exception) { }
         }
-        prefs.edit().remove("bridge_token").remove("device_id").remove("server_url").remove("inflight_job").remove("inflight_started_at").remove("known_numbers").apply()
+        BridgeStore.clearInflight(this)
+        prefs.edit().remove("bridge_token").remove("device_id").remove("server_url").remove("known_numbers").remove("pending_numbers").remove("inflight_phone").apply()
         showUnpairedState()
         statusText.text = "This phone is unpaired. Revoke the device in Atlas SMS Settings if it is still shown there."
     }
@@ -199,13 +199,13 @@ class MainActivity : Activity() {
     private fun isLocalServerAddress(value: String): Boolean {
         return try {
             val url = URL(value)
-            if (url.protocol != "http" || url.port !in 1..65535) return false
+            if (url.protocol != "http" || url.port !in 1..65535 || !url.userInfo.isNullOrEmpty()
+                || url.path !in listOf("", "/") || !url.query.isNullOrEmpty() || !url.ref.isNullOrEmpty()) return false
             val host = url.host.lowercase()
-            if (host == "localhost") return true
-            val address = java.net.InetAddress.getByName(host)
-            if (address !is Inet4Address) return false
-            val bytes = address.address.map { it.toInt() and 0xff }
-            bytes[0] == 10 || (bytes[0] == 192 && bytes[1] == 168) || (bytes[0] == 172 && bytes[1] in 16..31) || (bytes[0] == 127) || (bytes[0] == 169 && bytes[1] == 254)
+            val parts = host.split('.')
+            if (parts.size != 4 || parts.any { it.isEmpty() || (it.length > 1 && it.startsWith('0')) }) return false
+            val bytes = parts.map { it.toIntOrNull()?.takeIf { octet -> octet in 0..255 } ?: return false }
+            bytes[0] == 10 || (bytes[0] == 192 && bytes[1] == 168) || (bytes[0] == 172 && bytes[1] in 16..31) || (bytes[0] == 169 && bytes[1] == 254)
         } catch (_: Exception) { false }
     }
 

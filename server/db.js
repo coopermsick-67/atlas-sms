@@ -3,8 +3,15 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 
 const dataDir = path.resolve(process.env.ATLAS_DATA_DIR || './data');
-fs.mkdirSync(dataDir, { recursive: true });
-export const db = new Database(path.join(dataDir, 'atlas.sqlite'));
+fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+const databasePath = path.join(dataDir, 'atlas.sqlite');
+const databaseFile = fs.openSync(databasePath, 'a', 0o600);
+fs.closeSync(databaseFile);
+if (process.platform !== 'win32') {
+  fs.chmodSync(dataDir, 0o700);
+  fs.chmodSync(databasePath, 0o600);
+}
+export const db = new Database(databasePath);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
@@ -77,6 +84,7 @@ CREATE TABLE IF NOT EXISTS bridge_devices (
 );
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
+  source_id TEXT,
   phone TEXT NOT NULL,
   direction TEXT NOT NULL CHECK (direction IN ('inbound', 'outbound')),
   body TEXT NOT NULL,
@@ -90,6 +98,10 @@ CREATE INDEX IF NOT EXISTS idx_contacts_updated ON contacts(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_phone ON messages(phone, received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_recipients_status ON campaign_recipients(status, created_at);
 `);
+
+const messageColumns = new Set(db.prepare('PRAGMA table_info(messages)').all().map((column) => column.name));
+if (!messageColumns.has('source_id')) db.exec('ALTER TABLE messages ADD COLUMN source_id TEXT');
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source_id ON messages(source_id) WHERE source_id IS NOT NULL`);
 
 const insertSetting = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
 insertSetting.run('business_name', 'Atlas Property Buyers');

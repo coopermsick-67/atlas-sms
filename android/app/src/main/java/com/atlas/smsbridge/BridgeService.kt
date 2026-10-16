@@ -44,23 +44,16 @@ class BridgeService : Service() {
             }
             try {
                 postJson("$base/api/bridge/heartbeat", token, JSONObject().put("phone_number", ""))
-                val inflightJob = prefs.getString("inflight_job", null)
-                if (!inflightJob.isNullOrBlank()) {
-                    val startedAt = prefs.getLong("inflight_started_at", 0L)
-                    if (startedAt == 0L) {
-                        prefs.edit().putLong("inflight_started_at", System.currentTimeMillis()).apply()
-                    } else if (System.currentTimeMillis() - startedAt >= 6 * 60 * 1000L) {
-                        // The server marks jobs unknown after five minutes. Clear the local
-                        // lock after that point, but never retry the uncertain SMS.
-                        prefs.edit().remove("inflight_job").remove("inflight_started_at").apply()
-                    }
-                }
+                flushPendingInbound(base, token)
+                // The server marks jobs unknown after five minutes. Clear a stale local
+                // lock after that point, but never retry the uncertain SMS.
+                BridgeStore.clearStaleInflight(this, System.currentTimeMillis(), 6 * 60 * 1000L)
                 if (prefs.getString("inflight_job", null).isNullOrBlank()) {
                     val result = requestJson("$base/api/bridge/jobs/next", token)
                     if (!result.isNull("job")) {
                         val job = result.getJSONObject("job")
                         val id = job.getString("id")
-                        prefs.edit().putString("inflight_job", id).putLong("inflight_started_at", System.currentTimeMillis()).apply()
+                        BridgeStore.setInflight(this, id, job.getString("phone"))
                         sendJob(base, token, job)
                     }
                 }
@@ -72,15 +65,18 @@ class BridgeService : Service() {
     }
 
     private fun sendJob(base: String, token: String, job: JSONObject) {
+        val phone = job.getString("phone")
+        if (BridgeStore.isLocallySuppressed(this, phone)) {
+            reportResult(base, token, job.getString("id"), false, "This phone has a locally recorded opt-out reply.", phone)
+            return
+        }
         try {
-            val numbers = (prefs.getStringSet("known_numbers", emptySet()) ?: emptySet()).toMutableSet()
-            numbers.add(job.getString("phone"))
-            prefs.edit().putStringSet("known_numbers", numbers).apply()
+            BridgeStore.markOutboundPending(this, phone)
             val manager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) getSystemService(SmsManager::class.java) else SmsManager.getDefault()
             val body = job.getString("message")
             val parts = manager.divideMessage(body)
             if (parts.size > 6) {
-                reportResult(base, token, job.getString("id"), false, "Message is too long for the local SMS bridge.")
+                reportResult(base, token, job.getString("id"), false, "Message is too long for the local SMS bridge.", phone)
                 return
             }
             val sentIntents = ArrayList<PendingIntent>()
@@ -90,6 +86,7 @@ class BridgeService : Service() {
                     putExtra(EXTRA_JOB_ID, job.getString("id"))
                     putExtra(EXTRA_SERVER_URL, base)
                     putExtra(EXTRA_TOKEN, token)
+                    putExtra(EXTRA_PHONE, phone)
                     putExtra(EXTRA_SEGMENT_INDEX, index)
                     putExtra(EXTRA_SEGMENT_COUNT, parts.size)
                 }
@@ -100,15 +97,24 @@ class BridgeService : Service() {
             if (parts.size == 1) manager.sendTextMessage(job.getString("phone"), null, body, sentIntents[0], null)
             else manager.sendMultipartTextMessage(job.getString("phone"), null, parts, sentIntents, null)
         } catch (error: Exception) {
-            reportResult(base, token, job.getString("id"), false, error.message ?: "Android could not send this SMS.")
+            reportResult(base, token, job.getString("id"), false, error.message ?: "Android could not send this SMS.", phone)
         }
     }
 
-    private fun reportResult(base: String, token: String, jobId: String, success: Boolean, error: String) {
+    private fun flushPendingInbound(base: String, token: String) {
+        for (event in BridgeStore.pendingInbound(this)) {
+            val result = postJson("$base/api/bridge/inbound", token, event)
+            if (result.optBoolean("opted_out")) BridgeStore.acknowledgeOptOut(this, event.getString("phone"))
+            BridgeStore.removePendingInbound(this, event.getString("id"))
+        }
+    }
+
+    private fun reportResult(base: String, token: String, jobId: String, success: Boolean, error: String, phone: String) {
         try {
             postJson("$base/api/bridge/jobs/$jobId/result", token, JSONObject().put("success", success).put("error", error.take(240)))
         } catch (_: Exception) { }
-        prefs.edit().remove("inflight_job").remove("inflight_started_at").apply()
+        BridgeStore.finishOutbound(this, phone, success)
+        BridgeStore.clearInflightIfMatches(this, jobId)
     }
 
     private fun requestJson(address: String, token: String): JSONObject {
@@ -156,6 +162,7 @@ class BridgeService : Service() {
         const val EXTRA_JOB_ID = "job_id"
         const val EXTRA_SERVER_URL = "server_url"
         const val EXTRA_TOKEN = "bridge_token"
+        const val EXTRA_PHONE = "phone"
         const val EXTRA_SEGMENT_INDEX = "segment_index"
         const val EXTRA_SEGMENT_COUNT = "segment_count"
         private const val NOTIFICATION_ID = 7401

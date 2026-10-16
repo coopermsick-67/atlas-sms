@@ -33,7 +33,7 @@ The SQLite file is written to `data/atlas.sqlite`. Set `ATLAS_DATA_DIR` to a dif
 
 ## Import a lead file
 
-Choose **Import CSV**, select a file, and map its columns. The app accepts common column names and lets you override the mapping. Download `public/atlas-leads-template.csv` from the app's empty state for the recommended headers.
+Choose **Import CSV**, select a file, and map its columns. The app accepts common column names and lets you override the mapping. It rejects duplicate or blank headers, extra values beyond a row's headers, files over 7 MB, and imports over 50,000 rows. Download `public/atlas-leads-template.csv` from the app's empty state for the recommended headers.
 
 Consent does not come from having a phone number or a property record. A CSV row is marked consented only when it contains all of these fields:
 
@@ -51,15 +51,16 @@ Other imported rows stay blocked from live campaigns. The UI also lets an admin 
 3. Connect the phone and computer to the same Wi-Fi network. Enter the local computer address and the 6-digit code in Atlas SMS Bridge. The code expires after five minutes.
 4. Allow **Send SMS** and **Receive SMS** permissions. Keep the bridge active while a live campaign is running. On dual-SIM phones, choose the default outgoing SIM in Android settings.
 
-The bridge accepts only local/private network addresses and stores the pairing token on the phone. Atlas SMS stores only a hash of that token. The local app uses HTTP on the local network; do not expose or port-forward it to the public internet.
+The admin dashboard and its API accept connections only from this computer. The phone bridge accepts private-network connections, stores its pairing token on the phone, and Atlas SMS stores only a hash of that token. The local app uses HTTP on the local network; do not expose or port-forward it to the public internet.
 
 ## Campaign behavior
 
 - New campaigns default to **Dry run**. A dry run records a preview without sending any text.
 - Live send requires a paired, online Android phone, documented consent, a valid unsuppressed number, a typed recipient-count confirmation, and available daily capacity.
-- The app caps live sends at 100 texts per rolling 24-hour period. The cap can be lowered in settings.
+- The app caps live sends at 100 texts per rolling 24-hour period. The cap can be lowered in settings. Active queued messages reserve capacity, and canceled campaigns still count messages already attempted.
+- The phone rejects a personalized message that would split into more than six SMS segments, and Atlas checks its estimate before a campaign can be queued.
 - Messages are sent one at a time by the Android SIM. A failed message is logged and is not automatically retried.
-- Inbound replies are copied to the local conversation history. Replies such as STOP, END, QUIT, CANCEL, REMOVE, UNSUBSCRIBE, or “do not contact” add the number to the suppression list and cancel queued messages. The app does not send a follow-up text after an opt-out.
+- Inbound replies from numbers the phone has actually messaged are queued on the phone until the local server acknowledges them, then copied to the conversation history. STOP and common opt-out replies are locally blocked as soon as the phone receives them; the server records the suppression, even if the lead row is missing, and cancels queued messages. The app does not send a follow-up text after an opt-out.
 - If a phone goes offline after claiming a job, the status changes to **unknown** after five minutes. The app does not automatically retry an uncertain send, which avoids accidental duplicate texts.
 
 ## Important limits
