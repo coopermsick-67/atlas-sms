@@ -21,6 +21,14 @@ let lastJobClaimAt = 0;
 app.disable('x-powered-by');
 // JSON escaping can nearly double a valid 7 MB CSV before it reaches this parser.
 app.use('/api', (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
+app.use('/api', (req, res, next) => {
+  const requestPath = String(req.originalUrl || req.url || '').split('?', 1)[0].toLowerCase();
+  if (requestPath === '/api/bridge' || requestPath.startsWith('/api/bridge/')) return next();
+  if (!isLoopbackAddress(req.socket.remoteAddress || req.ip || '')) {
+    return replyError(res, 403, 'Open the Atlas dashboard on the computer running it.');
+  }
+  return next();
+});
 app.use('/api/import', express.json({ limit: '20mb' }));
 app.use('/api/bridge', express.json({ limit: '32kb' }));
 app.use('/api', express.json({ limit: '256kb' }));
@@ -92,22 +100,19 @@ function verifyPassword(password, salt, expected) {
   return safeEqual(actual, expected);
 }
 
-function phoneSuppressed(phone) {
-  return Boolean(db.prepare('SELECT phone FROM suppressions WHERE phone = ? AND released_at IS NULL').get(phone));
-}
-
 function getContactById(id) {
-  const contact = db.prepare('SELECT * FROM contacts WHERE id = ?').get(id);
-  if (!contact) return null;
-  return { ...contact, is_suppressed: phoneSuppressed(contact.phone) };
+  return db.prepare(`SELECT contacts.*,
+    EXISTS (SELECT 1 FROM suppressions s WHERE s.phone = contacts.phone AND s.released_at IS NULL) AS is_suppressed
+    FROM contacts WHERE id = ?`).get(id) || null;
 }
 
 function getContactsByIds(ids) {
   if (!Array.isArray(ids) || ids.length === 0) return [];
   const safeIds = [...new Set(ids.map(String))].slice(0, 2000);
   const placeholders = safeIds.map(() => '?').join(',');
-  return db.prepare(`SELECT * FROM contacts WHERE id IN (${placeholders})`).all(...safeIds)
-    .map((contact) => ({ ...contact, is_suppressed: phoneSuppressed(contact.phone) }));
+  return db.prepare(`SELECT contacts.*,
+      EXISTS (SELECT 1 FROM suppressions s WHERE s.phone = contacts.phone AND s.released_at IS NULL) AS is_suppressed
+    FROM contacts WHERE id IN (${placeholders})`).all(...safeIds);
 }
 
 function importData(csvText) {
@@ -134,11 +139,12 @@ function getStats() {
 }
 
 function mapContact(contact) {
+  const isSuppressed = Boolean(contact.is_suppressed);
   return {
     ...contact,
     first_name: String(contact.name || '').trim().split(/\s+/)[0] || '',
-    is_suppressed: phoneSuppressed(contact.phone),
-    eligibility: eligibility(contact, phoneSuppressed(contact.phone))
+    is_suppressed: isSuppressed,
+    eligibility: eligibility(contact, isSuppressed)
   };
 }
 
@@ -380,7 +386,9 @@ adminApi.get('/leads', (req, res) => {
   if (view === 'suppressed') clauses.push(`EXISTS (SELECT 1 FROM suppressions s WHERE s.phone = contacts.phone AND s.released_at IS NULL)`);
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const total = db.prepare(`SELECT COUNT(*) AS count FROM contacts ${where}`).get(...params).count;
-  const rows = db.prepare(`SELECT * FROM contacts ${where} ORDER BY updated_at DESC LIMIT ? OFFSET ?`)
+  const rows = db.prepare(`SELECT contacts.*,
+      EXISTS (SELECT 1 FROM suppressions s WHERE s.phone = contacts.phone AND s.released_at IS NULL) AS is_suppressed
+    FROM contacts ${where} ORDER BY updated_at DESC LIMIT ? OFFSET ?`)
     .all(...params, limit, (page - 1) * limit).map(mapContact);
   return res.json({ rows, total, page, limit, pages: Math.max(1, Math.ceil(total / limit)), stats: getStats() });
 });
