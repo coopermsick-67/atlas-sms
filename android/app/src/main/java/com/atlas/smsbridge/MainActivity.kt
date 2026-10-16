@@ -3,6 +3,7 @@ package com.atlas.smsbridge
 import android.Manifest
 import android.app.Activity
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Typeface
 import android.os.Build
@@ -23,6 +24,9 @@ import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
     private val prefs by lazy { getSharedPreferences("atlas_bridge", MODE_PRIVATE) }
+    private val bridgePrefsListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == "bridge_auth_error" && hasBridgeToken()) runOnUiThread { showPairedState() }
+    }
     private val executor = Executors.newSingleThreadExecutor()
     private lateinit var serverInput: EditText
     private lateinit var codeInput: EditText
@@ -37,6 +41,17 @@ class MainActivity : Activity() {
         buildUi()
         fillSavedState()
         if (hasBridgeToken()) showPairedState() else showUnpairedState()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        prefs.registerOnSharedPreferenceChangeListener(bridgePrefsListener)
+        if (hasBridgeToken()) showPairedState()
+    }
+
+    override fun onPause() {
+        prefs.unregisterOnSharedPreferenceChangeListener(bridgePrefsListener)
+        super.onPause()
     }
 
     private fun buildUi() {
@@ -112,7 +127,7 @@ class MainActivity : Activity() {
                 connection.outputStream.use { it.write(JSONObject().put("code", code).put("name", deviceName).toString().toByteArray()) }
                 val response = connection.inputStream.bufferedReader().use { it.readText() }
                 val data = JSONObject(response)
-                prefs.edit().putString("server_url", base).putString("bridge_token", data.getString("token")).putString("device_id", data.getString("device_id")).putString("device_name", deviceName).apply()
+                prefs.edit().putBoolean("bridge_auth_error", false).putString("server_url", base).putString("bridge_token", data.getString("token")).putString("device_id", data.getString("device_id")).putString("device_name", deviceName).apply()
                 runOnUiThread { statusText.text = "Phone paired. Allow SMS access, then start the bridge."; pairButton.isEnabled = true; showPairedState() }
             } catch (error: Exception) {
                 runOnUiThread { statusText.text = "Could not pair. Check the computer address, same Wi-Fi, and that the pairing code has not expired."; pairButton.isEnabled = true }
@@ -171,7 +186,7 @@ class MainActivity : Activity() {
             } catch (_: Exception) { }
         }
         BridgeStore.clearInflight(this)
-        prefs.edit().remove("bridge_token").remove("device_id").remove("server_url").remove("known_numbers").remove("pending_numbers").remove("inflight_phone").apply()
+        prefs.edit().putBoolean("bridge_auth_error", false).remove("bridge_token").remove("device_id").remove("server_url").remove("known_numbers").remove("pending_numbers").remove("inflight_phone").apply()
         showUnpairedState()
         statusText.text = "This phone is unpaired. Revoke the device in Atlas SMS Settings if it is still shown there."
     }
@@ -185,8 +200,13 @@ class MainActivity : Activity() {
     private fun showPairedState() {
         pairButton.visibility = View.GONE
         codeInput.visibility = View.GONE
-        statusText.text = "This phone is paired. Tap Start SMS bridge to connect."
-        serviceButton.visibility = View.VISIBLE
+        val pairingRevoked = prefs.getBoolean("bridge_auth_error", false)
+        statusText.text = if (pairingRevoked) {
+            "Atlas SMS revoked this phone’s pairing. Tap Unpair, then create a fresh pairing code in Atlas Settings."
+        } else {
+            "This phone is paired. Tap Start SMS bridge to connect."
+        }
+        serviceButton.visibility = if (pairingRevoked) View.GONE else View.VISIBLE
         unpairButton.visibility = View.VISIBLE
     }
     private fun showUnpairedState() {

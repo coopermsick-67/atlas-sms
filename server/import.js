@@ -97,6 +97,7 @@ export function importRecords(records, mapping) {
         skipped.push({ row: record.row_number, reason: 'No valid phone number' });
         continue;
       }
+      const insertedInThisImport = inserted.has(phone);
       const existing = getExisting.get(phone);
       const consent = parseConsent(read(record, mapping, 'consent_status'));
       const source = read(record, mapping, 'consent_source');
@@ -129,7 +130,11 @@ export function importRecords(records, mapping) {
           WHERE phone = ? AND status = 'queued'`).run(phone);
         for (const campaignId of campaignIds) finalizeCampaignIfIdle(campaignId);
       }
-      (existing ? updated : inserted).add(phone);
+      if (existing) {
+        if (!insertedInThisImport) updated.add(phone);
+      } else {
+        inserted.add(phone);
+      }
     }
   });
   tx();

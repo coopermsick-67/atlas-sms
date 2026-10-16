@@ -643,9 +643,15 @@ adminApi.delete('/bridge/devices/:id', (req, res) => {
 });
 
 app.use('/api', adminApi);
+app.use('/api', (_req, res) => replyError(res, 404, 'API route not found.'));
 
 function getPrimaryLanAddress() {
-  const interfaces = os.networkInterfaces();
+  let interfaces;
+  try {
+    interfaces = os.networkInterfaces();
+  } catch {
+    return '127.0.0.1';
+  }
   for (const entries of Object.values(interfaces)) {
     for (const entry of entries || []) {
       if (entry.family === 'IPv4' && !entry.internal && isPrivateNetworkAddress(entry.address) && !isLoopbackAddress(entry.address)) return entry.address;

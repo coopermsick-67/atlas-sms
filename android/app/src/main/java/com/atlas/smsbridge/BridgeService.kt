@@ -8,13 +8,17 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.telephony.SmsManager
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+
+private class BridgeUnauthorizedException : java.io.IOException("The Atlas SMS pairing is no longer valid.")
 
 class BridgeService : Service() {
     private val executor = Executors.newSingleThreadExecutor()
@@ -57,6 +61,14 @@ class BridgeService : Service() {
                         sendJob(base, token, job)
                     }
                 }
+            } catch (_: BridgeUnauthorizedException) {
+                active.set(false)
+                prefs.edit().putBoolean("bridge_auth_error", true).commit()
+                Handler(Looper.getMainLooper()).post {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
+                break
             } catch (_: Exception) {
                 Thread.sleep(4000)
             }
@@ -122,7 +134,11 @@ class BridgeService : Service() {
             requestMethod = "GET"; connectTimeout = 8000; readTimeout = 8000
             setRequestProperty("Authorization", "Bearer $token")
         }
-        return connection.inputStream.bufferedReader().use { JSONObject(it.readText()) }
+        return try {
+            readResponse(connection)
+        } finally {
+            connection.disconnect()
+        }
     }
 
     private fun postJson(address: String, token: String, json: JSONObject): JSONObject {
@@ -131,8 +147,20 @@ class BridgeService : Service() {
             setRequestProperty("Authorization", "Bearer $token")
             setRequestProperty("Content-Type", "application/json")
         }
-        connection.outputStream.use { it.write(json.toString().toByteArray()) }
-        return connection.inputStream.bufferedReader().use { JSONObject(it.readText()) }
+        return try {
+            connection.outputStream.use { it.write(json.toString().toByteArray()) }
+            readResponse(connection)
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun readResponse(connection: HttpURLConnection): JSONObject {
+        val status = connection.responseCode
+        if (status == HttpURLConnection.HTTP_UNAUTHORIZED) throw BridgeUnauthorizedException()
+        if (status !in 200..299) throw java.io.IOException("Local Atlas server returned HTTP $status.")
+        val body = connection.inputStream.bufferedReader().use { it.readText() }
+        return if (body.isBlank()) JSONObject() else JSONObject(body)
     }
 
     private fun notification(): Notification {
