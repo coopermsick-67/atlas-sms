@@ -46,7 +46,7 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         prefs.registerOnSharedPreferenceChangeListener(bridgePrefsListener)
-        if (hasBridgeToken()) showPairedState()
+        if (hasBridgeToken() && prefs.getBoolean("bridge_auth_error", false)) showPairedState()
     }
 
     override fun onPause() {
