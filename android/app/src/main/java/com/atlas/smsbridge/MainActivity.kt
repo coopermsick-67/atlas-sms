@@ -171,7 +171,7 @@ class MainActivity : Activity() {
                 connection.inputStream.close()
             } catch (_: Exception) { }
         }
-        prefs.edit().remove("bridge_token").remove("device_id").remove("server_url").remove("inflight_job").remove("known_numbers").apply()
+        prefs.edit().remove("bridge_token").remove("device_id").remove("server_url").remove("inflight_job").remove("inflight_started_at").remove("known_numbers").apply()
         showUnpairedState()
         statusText.text = "This phone is unpaired. Revoke the device in Atlas SMS Settings if it is still shown there."
     }

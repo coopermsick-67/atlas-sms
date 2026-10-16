@@ -37,7 +37,7 @@ class SmsStatusReceiver : BroadcastReceiver() {
                 connection.outputStream.use { it.write(JSONObject().put("success", failures == 0).put("error", error).toString().toByteArray()) }
                 connection.inputStream.close()
             } catch (_: Exception) { }
-            finally { prefs.edit().remove("inflight_job").apply() }
+            finally { prefs.edit().remove("inflight_job").remove("inflight_started_at").apply() }
         }.start()
     }
 }

@@ -44,12 +44,23 @@ class BridgeService : Service() {
             }
             try {
                 postJson("$base/api/bridge/heartbeat", token, JSONObject().put("phone_number", ""))
+                val inflightJob = prefs.getString("inflight_job", null)
+                if (!inflightJob.isNullOrBlank()) {
+                    val startedAt = prefs.getLong("inflight_started_at", 0L)
+                    if (startedAt == 0L) {
+                        prefs.edit().putLong("inflight_started_at", System.currentTimeMillis()).apply()
+                    } else if (System.currentTimeMillis() - startedAt >= 6 * 60 * 1000L) {
+                        // The server marks jobs unknown after five minutes. Clear the local
+                        // lock after that point, but never retry the uncertain SMS.
+                        prefs.edit().remove("inflight_job").remove("inflight_started_at").apply()
+                    }
+                }
                 if (prefs.getString("inflight_job", null).isNullOrBlank()) {
                     val result = requestJson("$base/api/bridge/jobs/next", token)
                     if (!result.isNull("job")) {
                         val job = result.getJSONObject("job")
                         val id = job.getString("id")
-                        prefs.edit().putString("inflight_job", id).apply()
+                        prefs.edit().putString("inflight_job", id).putLong("inflight_started_at", System.currentTimeMillis()).apply()
                         sendJob(base, token, job)
                     }
                 }
@@ -97,7 +108,7 @@ class BridgeService : Service() {
         try {
             postJson("$base/api/bridge/jobs/$jobId/result", token, JSONObject().put("success", success).put("error", error.take(240)))
         } catch (_: Exception) { }
-        prefs.edit().remove("inflight_job").apply()
+        prefs.edit().remove("inflight_job").remove("inflight_started_at").apply()
     }
 
     private fun requestJson(address: String, token: String): JSONObject {
