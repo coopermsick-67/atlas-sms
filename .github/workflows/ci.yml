@@ -23,6 +23,7 @@ jobs:
         with:
           node-version: 20
       - run: npm install --no-audit --no-fund
+      - run: npm audit --audit-level=high
       - run: npm run check
 
   android:
